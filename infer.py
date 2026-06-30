@@ -62,8 +62,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--score-chunk", type=int, default=None)
     parser.add_argument("--posterior-probes", type=int, default=None)
     parser.add_argument("--posterior-chunk", type=int, default=None)
+    parser.add_argument("--nuisance-time-components", type=int, default=None)
+    parser.add_argument("--nuisance-noise-probes", type=int, default=None)
     parser.add_argument("--profile-steps", type=int, default=None)
     parser.add_argument("--profile-lr", type=float, default=None)
+    parser.add_argument("--profile-starts", type=int, default=None)
+    parser.add_argument("--profile-start-scale", type=float, default=None)
     parser.add_argument("--profile-energy-probes", type=int, default=None)
     parser.add_argument("--posterior-t-min", type=float, default=None)
     parser.add_argument("--posterior-t-max", type=float, default=None)
@@ -106,8 +110,12 @@ def override_profile(profile: ProfileConfig, args: argparse.Namespace) -> Profil
         "score_chunk": args.score_chunk,
         "posterior_probes": args.posterior_probes,
         "posterior_chunk": args.posterior_chunk,
+        "nuisance_time_components": args.nuisance_time_components,
+        "nuisance_noise_probes": args.nuisance_noise_probes,
         "profile_steps": args.profile_steps,
         "profile_lr": args.profile_lr,
+        "profile_starts": args.profile_starts,
+        "profile_start_scale": args.profile_start_scale,
         "profile_energy_probes": args.profile_energy_probes,
         "posterior_t_min": args.posterior_t_min,
         "posterior_t_max": args.posterior_t_max,

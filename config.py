@@ -62,12 +62,16 @@ class ProfileConfig:
     score_chunk: int = 4
     posterior_probes: int = 4
     posterior_chunk: int = 4
+    nuisance_time_components: int = 5
+    nuisance_noise_probes: int = 4
     posterior_t_min: float = 0.10
     posterior_t_max: float = 0.70
     nuisance_var_floor: float = 0.05
     nuisance_var_scale: float = 1.0
     profile_steps: int = 14
     profile_lr: float = 0.08
+    profile_starts: int = 3
+    profile_start_scale: float = 0.05
     profile_energy_probes: int = 4
     profile_clip: float = 16.0
     profile_score_mode: str = "profiled"
