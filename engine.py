@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import random
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -58,6 +59,20 @@ def to_jsonable(value: Any) -> Any:
     if isinstance(value, (np.bool_,)):
         return bool(value)
     return value
+
+
+@contextmanager
+def disabled_parameter_grads(model: nn.Module):
+    """Disable parameter gradients while preserving input gradients."""
+    parameters = list(model.parameters())
+    states = [parameter.requires_grad for parameter in parameters]
+    try:
+        for parameter in parameters:
+            parameter.requires_grad_(False)
+        yield
+    finally:
+        for parameter, state in zip(parameters, states):
+            parameter.requires_grad_(state)
 
 
 class ModelEMA:
@@ -178,22 +193,75 @@ def fixed_score_times(probes: int, device: torch.device, cfg: DiffusionConfig) -
     return torch.linspace(max(cfg.t_eps, 0.03), 0.95, steps=probes, device=device)
 
 
-def static_energy_with_fixed_noise(
+def _score_from_eps(model: ScoreTransformer, x_t: torch.Tensor, t: torch.Tensor, schedule: VPSchedule) -> torch.Tensor:
+    _, sigma = schedule.alpha_sigma(t)
+    eps_pred = model(x_t, t)
+    return -eps_pred / sigma.view(-1, 1, 1).clamp_min(1e-5)
+
+
+def _probability_flow_velocity(
+    model: ScoreTransformer,
+    x_t: torch.Tensor,
+    t: torch.Tensor,
+    schedule: VPSchedule,
+) -> torch.Tensor:
+    beta = schedule.beta(t).view(-1, 1, 1)
+    score = _score_from_eps(model, x_t, t, schedule)
+    return -0.5 * beta * x_t - 0.5 * beta * score
+
+
+def _divergence_hutchinson(
+    velocity: torch.Tensor,
+    x_t: torch.Tensor,
+    probes: int,
+) -> torch.Tensor:
+    estimates = []
+    for _ in range(max(int(probes), 1)):
+        noise = torch.empty_like(x_t).bernoulli_(0.5).mul_(2.0).sub_(1.0)
+        projected = (velocity * noise).flatten(1).sum()
+        grad = torch.autograd.grad(projected, x_t, create_graph=True, retain_graph=True)[0]
+        estimates.append((grad * noise).flatten(1).sum(dim=1))
+    return torch.stack(estimates, dim=0).mean(dim=0)
+
+
+def probability_flow_nll(
+    model: ScoreTransformer,
+    values: torch.Tensor,
+    schedule: VPSchedule,
+    diffusion_cfg: DiffusionConfig,
+) -> torch.Tensor:
+    """Per-cell negative log likelihood from the VP probability-flow ODE.
+
+    The ODE is integrated from t=t_eps to t=1, and the change-of-variables
+    divergence is estimated with Hutchinson probes. This implements the README
+    clean-normal anchor E_theta(x) = -log p_theta(x), rather than using the
+    DSM training loss itself as an anomaly score.
+    """
+    steps = max(int(diffusion_cfg.likelihood_steps), 1)
+    x = values
+    div_integral = torch.zeros(values.shape[0], device=values.device, dtype=values.dtype)
+    t0 = float(diffusion_cfg.t_eps)
+    dt = (1.0 - t0) / steps
+    for step in range(steps):
+        t_scalar = t0 + (step + 0.5) * dt
+        t = torch.full((values.shape[0],), t_scalar, device=values.device, dtype=values.dtype)
+        x_req = x.requires_grad_(True)
+        velocity = _probability_flow_velocity(model, x_req, t, schedule)
+        div = _divergence_hutchinson(velocity, x_req, diffusion_cfg.likelihood_hutchinson_probes)
+        div_integral = div_integral + div * dt
+        x = x_req + velocity * dt
+    log_p1 = -0.5 * (x.pow(2) + math.log(2.0 * math.pi)).flatten(1).sum(dim=1)
+    nll = -(log_p1 + div_integral)
+    return nll / values[0].numel()
+
+
+def clean_energy_for_profile(
     model: ScoreTransformer,
     z: torch.Tensor,
     schedule: VPSchedule,
-    t_values: torch.Tensor,
-    noises: torch.Tensor,
 ) -> torch.Tensor:
-    """Differentiable denoising energy for a fixed [K, B, T, C] noise bank."""
-    energies = []
-    for index, t_scalar in enumerate(t_values):
-        t = torch.full((z.shape[0],), float(t_scalar.item()), device=z.device)
-        noise = noises[index]
-        x_t = schedule.q_sample(z, t, noise)
-        eps_pred = model(x_t, t)
-        energies.append((eps_pred - noise).pow(2).flatten(1).mean(dim=1))
-    return torch.stack(energies, dim=0).mean(dim=0)
+    """Differentiable clean-normal energy E_theta(z) used inside profiling."""
+    return probability_flow_nll(model, z, schedule, schedule.cfg)
 
 
 @torch.no_grad()
@@ -205,28 +273,12 @@ def static_energy(
     amp: bool,
     amp_dtype: str,
 ) -> torch.Tensor:
-    """MC denoising energy proxy for clean diffusion normality."""
-    device = values.device
+    """Probability-flow ODE clean-normal negative log likelihood."""
     dtype = resolve_amp_dtype(amp_dtype)
-    times = fixed_score_times(profile_cfg.score_probes, device, schedule.cfg)
-    total = torch.zeros(values.shape[0], device=device)
-    done = 0
-    for start in range(0, len(times), profile_cfg.score_chunk):
-        subset = times[start : start + profile_cfg.score_chunk]
-        chunk_sum = torch.zeros(values.shape[0], device=device)
-        for t_scalar in subset:
-            t = torch.full((values.shape[0],), float(t_scalar.item()), device=device)
-            noise = torch.randn_like(values)
-            with torch.autocast(device_type=device.type, dtype=dtype, enabled=amp and device.type == "cuda"):
-                x_t = schedule.q_sample(values, t, noise)
-                eps_pred = model(x_t, t)
-                chunk_sum += (eps_pred - noise).pow(2).flatten(1).mean(dim=1)
-        total += chunk_sum
-        done += len(subset)
-    return total / max(done, 1)
+    with torch.enable_grad(), torch.autocast(device_type=values.device.type, dtype=dtype, enabled=amp and values.device.type == "cuda"):
+        return probability_flow_nll(model, values, schedule, schedule.cfg).detach()
 
 
-@torch.no_grad()
 def posterior_variance_diag(
     model: ScoreTransformer,
     values: torch.Tensor,
@@ -234,16 +286,20 @@ def posterior_variance_diag(
     profile_cfg: ProfileConfig,
     amp: bool,
     amp_dtype: str,
+    time_values: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Diffusion-induced diagonal posterior uncertainty via x0-hat variance."""
     device = values.device
     dtype = resolve_amp_dtype(amp_dtype)
     x0_hats = []
-    probes = int(profile_cfg.posterior_probes)
+    if time_values is None:
+        probes = int(profile_cfg.posterior_probes)
+        time_values = torch.empty(probes, device=device).uniform_(profile_cfg.posterior_t_min, profile_cfg.posterior_t_max)
+    probes = int(time_values.numel())
     for start in range(0, probes, profile_cfg.posterior_chunk):
         count = min(profile_cfg.posterior_chunk, probes - start)
         v_rep = values.repeat_interleave(count, dim=0)
-        t = torch.empty(v_rep.shape[0], device=device).uniform_(profile_cfg.posterior_t_min, profile_cfg.posterior_t_max)
+        t = time_values[start : start + count].repeat(values.shape[0])
         noise = torch.randn_like(v_rep)
         with torch.autocast(device_type=device.type, dtype=dtype, enabled=amp and device.type == "cuda"):
             x_t = schedule.q_sample(v_rep, t, noise)
@@ -252,15 +308,95 @@ def posterior_variance_diag(
         x0_hats.append(x0_hat.float().view(values.shape[0], count, *values.shape[1:]))
     stacked = torch.cat(x0_hats, dim=1)
     var = stacked.var(dim=1, unbiased=False)
-    return (profile_cfg.nuisance_var_scale * var + profile_cfg.nuisance_var_floor).detach().clamp_min(1e-6)
+    return (profile_cfg.nuisance_var_scale * var + profile_cfg.nuisance_var_floor).clamp_min(1e-6)
 
 
 def nuisance_code(delta: torch.Tensor, var_diag: torch.Tensor) -> torch.Tensor:
     """Gaussian diagonal nuisance negative log code length, averaged per cell."""
-    return 0.5 * (delta.pow(2) / var_diag + torch.log(var_diag)).flatten(1).mean(dim=1)
+    return 0.5 * (delta.pow(2) / var_diag + torch.log(var_diag) + math.log(2.0 * math.pi)).flatten(1).mean(dim=1)
+
+
+def nuisance_time_grid(profile_cfg: ProfileConfig, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    components = max(int(profile_cfg.nuisance_time_components), 1)
+    if components == 1:
+        mid = 0.5 * (profile_cfg.posterior_t_min + profile_cfg.posterior_t_max)
+        return torch.tensor([mid], device=device, dtype=dtype)
+    return torch.linspace(profile_cfg.posterior_t_min, profile_cfg.posterior_t_max, steps=components, device=device, dtype=dtype)
+
+
+def nuisance_mixture_code(
+    model: ScoreTransformer,
+    delta: torch.Tensor,
+    z: torch.Tensor,
+    schedule: VPSchedule,
+    profile_cfg: ProfileConfig,
+    amp: bool,
+    amp_dtype: str,
+) -> torch.Tensor:
+    """Time-mixture nuisance code -log int N(delta; 0, K_theta(z,t)) pi(t) dt.
+
+    K_theta is represented by a diagonal covariance estimated from local
+    denoising posterior samples at each nuisance time. The mixture normalization
+    is kept with logsumexp, so large correction scale is not free.
+    """
+    component_times = nuisance_time_grid(profile_cfg, z.device, z.dtype)
+    component_codes = []
+    noise_probes = max(int(profile_cfg.nuisance_noise_probes), 1)
+    for t_scalar in component_times:
+        local_times = torch.full((noise_probes,), float(t_scalar.item()), device=z.device, dtype=z.dtype)
+        var_diag = posterior_variance_diag(model, z, schedule, profile_cfg, amp, amp_dtype, time_values=local_times)
+        component_codes.append(nuisance_code(delta, var_diag))
+    stacked_codes = torch.stack(component_codes, dim=0)
+    cells = float(delta[0].numel())
+    stacked_nll = stacked_codes * cells
+    mixture_nll = -torch.logsumexp(-stacked_nll, dim=0) + math.log(float(stacked_nll.shape[0]))
+    return mixture_nll / cells
+
+
+def initialize_profile_latents(y: torch.Tensor, profile_cfg: ProfileConfig) -> tuple[torch.Tensor, int]:
+    starts = max(int(profile_cfg.profile_starts), 1)
+    if starts == 1:
+        return y.detach().clone().requires_grad_(True), starts
+    seeds = [y.detach()]
+    for _ in range(starts - 1):
+        seeds.append(y.detach() + profile_cfg.profile_start_scale * torch.randn_like(y))
+    z = torch.cat(seeds, dim=0).requires_grad_(True)
+    return z, starts
+
+
+def repeat_for_profile_starts(y: torch.Tensor, starts: int) -> torch.Tensor:
+    if starts == 1:
+        return y
+    return y.repeat(starts, 1, 1)
+
+
+def select_best_profile(
+    values: torch.Tensor,
+    starts: int,
+    score: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if starts == 1:
+        return values, score
+    batch = score.shape[0] // starts
+    score_matrix = score.view(starts, batch).transpose(0, 1)
+    best = score_matrix.argmin(dim=1)
+    values_view = values.view(starts, batch, *values.shape[1:]).transpose(0, 1)
+    chosen = values_view[torch.arange(batch, device=values.device), best]
+    chosen_score = score_matrix[torch.arange(batch, device=score.device), best]
+    return chosen, chosen_score
 
 
 def profile_score_batch(
+    model: ScoreTransformer,
+    y: torch.Tensor,
+    schedule: VPSchedule,
+    inference_cfg: InferenceConfig,
+) -> dict[str, torch.Tensor]:
+    with disabled_parameter_grads(model):
+        return _profile_score_batch_impl(model, y, schedule, inference_cfg)
+
+
+def _profile_score_batch_impl(
     model: ScoreTransformer,
     y: torch.Tensor,
     schedule: VPSchedule,
@@ -280,17 +416,23 @@ def profile_score_batch(
             "profile_improvement": zeros,
         }
 
-    var_diag = posterior_variance_diag(model, y, schedule, profile_cfg, inference_cfg.amp, inference_cfg.amp_dtype)
-    z = y.detach().clone().requires_grad_(True)
-    t_values = fixed_score_times(profile_cfg.profile_energy_probes, y.device, schedule.cfg)
-    noise_bank = torch.randn(len(t_values), *y.shape, device=y.device)
+    z, starts = initialize_profile_latents(y, profile_cfg)
+    y_profile = repeat_for_profile_starts(y, starts)
     optimizer = torch.optim.Adam([z], lr=profile_cfg.profile_lr)
 
     progress = range(profile_cfg.profile_steps)
     for _ in progress:
         optimizer.zero_grad(set_to_none=True)
-        clean_e = static_energy_with_fixed_noise(model, z, schedule, t_values, noise_bank)
-        code = nuisance_code(y - z, var_diag)
+        clean_e = clean_energy_for_profile(model, z, schedule)
+        code = nuisance_mixture_code(
+            model,
+            y_profile - z,
+            z,
+            schedule,
+            profile_cfg,
+            inference_cfg.amp,
+            inference_cfg.amp_dtype,
+        )
         objective = (clean_e + code).mean()
         objective.backward()
         optimizer.step()
@@ -298,11 +440,25 @@ def profile_score_batch(
             z.clamp_(-profile_cfg.profile_clip, profile_cfg.profile_clip)
 
     with torch.no_grad():
-        profiled_e = static_energy(model, z.detach(), schedule, profile_cfg, inference_cfg.amp, inference_cfg.amp_dtype)
+        z_all = z.detach()
+        profiled_e_all = static_energy(model, z_all, schedule, profile_cfg, inference_cfg.amp, inference_cfg.amp_dtype)
+        code_all = nuisance_mixture_code(
+            model,
+            y_profile - z_all,
+            z_all,
+            schedule,
+            profile_cfg,
+            inference_cfg.amp,
+            inference_cfg.amp_dtype,
+        )
+        score_all = profiled_e_all + code_all
+        z_best, score = select_best_profile(z_all, starts, score_all)
+        profiled_e, _ = select_best_profile(profiled_e_all.view(-1, 1, 1), starts, score_all)
+        profiled_e = profiled_e.flatten()
+        code, _ = select_best_profile(code_all.view(-1, 1, 1), starts, score_all)
+        code = code.flatten()
         static_e = static_energy(model, y, schedule, profile_cfg, inference_cfg.amp, inference_cfg.amp_dtype)
-        code = nuisance_code(y - z.detach(), var_diag)
-        score = profiled_e + code
-        correction = y - z.detach()
+        correction = y - z_best
         correction_rms = correction.pow(2).flatten(1).mean(dim=1).sqrt()
     return {
         "score": score,
