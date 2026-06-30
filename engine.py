@@ -172,28 +172,84 @@ def train_one_epoch(
     return {key: value / max(steps, 1) for key, value in sums.items()}
 
 
-def fixed_score_times(probes: int, device: torch.device, cfg: DiffusionConfig) -> torch.Tensor:
-    if probes <= 1:
-        return torch.tensor([0.5], device=device)
-    return torch.linspace(max(cfg.t_eps, 0.03), 0.95, steps=probes, device=device)
+def score_from_eps(model: ScoreTransformer, x_t: torch.Tensor, t: torch.Tensor, schedule: VPSchedule) -> torch.Tensor:
+    """Convert the trained epsilon-prediction network to the VP-SDE score."""
+    _, sigma = schedule.alpha_sigma(t)
+    return -model(x_t, t) / sigma.view(-1, 1, 1).clamp_min(1e-5)
 
 
-def static_energy_with_fixed_noise(
+def probability_flow_drift(model: ScoreTransformer, x_t: torch.Tensor, t: torch.Tensor, schedule: VPSchedule) -> torch.Tensor:
+    """VP probability-flow ODE drift f(x,t) - 0.5 g(t)^2 score(x,t)."""
+    beta = schedule.beta(t).view(-1, 1, 1)
+    score = score_from_eps(model, x_t, t, schedule)
+    return -0.5 * beta * x_t - 0.5 * beta * score
+
+
+def _hutchinson_divergence(drift: torch.Tensor, x_t: torch.Tensor, probe: torch.Tensor, create_graph: bool) -> torch.Tensor:
+    """Per-sample Hutchinson trace estimate for div_x drift(x,t)."""
+    vjp = torch.autograd.grad(
+        outputs=(drift * probe).sum(),
+        inputs=x_t,
+        create_graph=create_graph,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    return (vjp * probe).flatten(1).sum(dim=1)
+
+
+def probability_flow_nll_fixed(
     model: ScoreTransformer,
-    z: torch.Tensor,
+    x0: torch.Tensor,
     schedule: VPSchedule,
     t_values: torch.Tensor,
-    noises: torch.Tensor,
+    probes: torch.Tensor,
+    create_graph: bool,
 ) -> torch.Tensor:
-    """Differentiable denoising energy for a fixed [K, B, T, C] noise bank."""
-    energies = []
-    for index, t_scalar in enumerate(t_values):
-        t = torch.full((z.shape[0],), float(t_scalar.item()), device=z.device)
-        noise = noises[index]
-        x_t = schedule.q_sample(z, t, noise)
-        eps_pred = model(x_t, t)
-        energies.append((eps_pred - noise).pow(2).flatten(1).mean(dim=1))
-    return torch.stack(energies, dim=0).mean(dim=0)
+    """Probability-flow ODE negative log likelihood per tensor cell.
+
+    This is the README clean-normal density anchor, integrated as
+    log p_0(x_0) = log p_1(x_1) + integral_0^1 div v_t(x_t) dt.
+    """
+    if t_values.numel() < 2:
+        raise ValueError("probability-flow likelihood requires at least two time values")
+    was_training = model.training
+    model.eval()
+    x = x0
+    integral_div = torch.zeros(x0.shape[0], device=x0.device, dtype=x0.dtype)
+    for idx in range(t_values.numel() - 1):
+        t0 = t_values[idx]
+        t1 = t_values[idx + 1]
+        dt = t1 - t0
+        x = x.requires_grad_(True)
+        t = torch.full((x.shape[0],), float(t0.item()), device=x.device, dtype=x.dtype)
+        drift = probability_flow_drift(model, x, t, schedule)
+        div = _hutchinson_divergence(drift, x, probes[idx], create_graph=create_graph)
+        integral_div = integral_div + div * dt
+        x = (x + drift * dt).clamp(-30.0, 30.0)
+        if not create_graph:
+            x = x.detach()
+    dim = x0[0].numel()
+    log_p1 = -0.5 * (x.flatten(1).pow(2).sum(dim=1) + dim * math.log(2.0 * math.pi))
+    if was_training:
+        model.train()
+    return -(log_p1 + integral_div) / float(dim)
+
+
+def probability_flow_nll(
+    model: ScoreTransformer,
+    values: torch.Tensor,
+    schedule: VPSchedule,
+    steps: int,
+    hutchinson_probes: int,
+    create_graph: bool = False,
+) -> torch.Tensor:
+    """Average probability-flow NLL across Hutchinson probes."""
+    t_values = torch.linspace(schedule.cfg.t_eps, 1.0, steps=max(steps, 2), device=values.device, dtype=values.dtype)
+    estimates = []
+    for _ in range(max(int(hutchinson_probes), 1)):
+        probes = torch.randn(t_values.numel() - 1, *values.shape, device=values.device, dtype=values.dtype)
+        estimates.append(probability_flow_nll_fixed(model, values, schedule, t_values, probes, create_graph=create_graph))
+    return torch.stack(estimates, dim=0).mean(dim=0)
 
 
 @torch.no_grad()
@@ -205,25 +261,17 @@ def static_energy(
     amp: bool,
     amp_dtype: str,
 ) -> torch.Tensor:
-    """MC denoising energy proxy for clean diffusion normality."""
-    device = values.device
-    dtype = resolve_amp_dtype(amp_dtype)
-    times = fixed_score_times(profile_cfg.score_probes, device, schedule.cfg)
-    total = torch.zeros(values.shape[0], device=device)
-    done = 0
-    for start in range(0, len(times), profile_cfg.score_chunk):
-        subset = times[start : start + profile_cfg.score_chunk]
-        chunk_sum = torch.zeros(values.shape[0], device=device)
-        for t_scalar in subset:
-            t = torch.full((values.shape[0],), float(t_scalar.item()), device=device)
-            noise = torch.randn_like(values)
-            with torch.autocast(device_type=device.type, dtype=dtype, enabled=amp and device.type == "cuda"):
-                x_t = schedule.q_sample(values, t, noise)
-                eps_pred = model(x_t, t)
-                chunk_sum += (eps_pred - noise).pow(2).flatten(1).mean(dim=1)
-        total += chunk_sum
-        done += len(subset)
-    return total / max(done, 1)
+    """Clean-normal energy E_theta(x) from probability-flow ODE NLL."""
+    del profile_cfg, amp, amp_dtype
+    with torch.enable_grad():
+        return probability_flow_nll(
+            model,
+            values.detach(),
+            schedule,
+            steps=schedule.cfg.likelihood_steps,
+            hutchinson_probes=schedule.cfg.likelihood_hutchinson_probes,
+            create_graph=False,
+        ).detach()
 
 
 @torch.no_grad()
@@ -280,16 +328,16 @@ def profile_score_batch(
             "profile_improvement": zeros,
         }
 
-    var_diag = posterior_variance_diag(model, y, schedule, profile_cfg, inference_cfg.amp, inference_cfg.amp_dtype)
     z = y.detach().clone().requires_grad_(True)
-    t_values = fixed_score_times(profile_cfg.profile_energy_probes, y.device, schedule.cfg)
-    noise_bank = torch.randn(len(t_values), *y.shape, device=y.device)
+    t_values = torch.linspace(schedule.cfg.t_eps, 1.0, steps=max(schedule.cfg.likelihood_steps, 2), device=y.device, dtype=y.dtype)
+    probe_bank = torch.randn(t_values.numel() - 1, *y.shape, device=y.device, dtype=y.dtype)
     optimizer = torch.optim.Adam([z], lr=profile_cfg.profile_lr)
 
     progress = range(profile_cfg.profile_steps)
     for _ in progress:
         optimizer.zero_grad(set_to_none=True)
-        clean_e = static_energy_with_fixed_noise(model, z, schedule, t_values, noise_bank)
+        var_diag = posterior_variance_diag(model, z.detach(), schedule, profile_cfg, inference_cfg.amp, inference_cfg.amp_dtype)
+        clean_e = probability_flow_nll_fixed(model, z, schedule, t_values, probe_bank, create_graph=True)
         code = nuisance_code(y - z, var_diag)
         objective = (clean_e + code).mean()
         objective.backward()
@@ -298,6 +346,7 @@ def profile_score_batch(
             z.clamp_(-profile_cfg.profile_clip, profile_cfg.profile_clip)
 
     with torch.no_grad():
+        var_diag = posterior_variance_diag(model, z.detach(), schedule, profile_cfg, inference_cfg.amp, inference_cfg.amp_dtype)
         profiled_e = static_energy(model, z.detach(), schedule, profile_cfg, inference_cfg.amp, inference_cfg.amp_dtype)
         static_e = static_energy(model, y, schedule, profile_cfg, inference_cfg.amp, inference_cfg.amp_dtype)
         code = nuisance_code(y - z.detach(), var_diag)
