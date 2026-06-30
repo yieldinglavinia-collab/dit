@@ -55,20 +55,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--amp", dest="amp", action="store_true", default=True)
     parser.add_argument("--no-amp", dest="amp", action="store_false")
     parser.add_argument("--amp-dtype", choices=("float16", "bfloat16"), default="float16")
-    parser.add_argument("--use-raw-weights", action="store_true", help="Use non-EMA weights from the checkpoint.")
+    parser.add_argument("--likelihood-steps", type=int, default=None)
 
-    parser.add_argument("--profile-mode", choices=("profiled", "static"), default=None)
     parser.add_argument("--score-probes", type=int, default=None)
     parser.add_argument("--score-chunk", type=int, default=None)
-    parser.add_argument("--posterior-probes", type=int, default=None)
-    parser.add_argument("--posterior-chunk", type=int, default=None)
     parser.add_argument("--profile-steps", type=int, default=None)
     parser.add_argument("--profile-lr", type=float, default=None)
     parser.add_argument("--profile-energy-probes", type=int, default=None)
-    parser.add_argument("--posterior-t-min", type=float, default=None)
-    parser.add_argument("--posterior-t-max", type=float, default=None)
-    parser.add_argument("--nuisance-var-floor", type=float, default=None)
-    parser.add_argument("--nuisance-var-scale", type=float, default=None)
     return parser
 
 
@@ -101,18 +94,11 @@ def dataclass_from_dict(cls: type, state: dict[str, Any] | None):
 
 def override_profile(profile: ProfileConfig, args: argparse.Namespace) -> ProfileConfig:
     overrides = {
-        "profile_score_mode": args.profile_mode,
         "score_probes": args.score_probes,
         "score_chunk": args.score_chunk,
-        "posterior_probes": args.posterior_probes,
-        "posterior_chunk": args.posterior_chunk,
         "profile_steps": args.profile_steps,
         "profile_lr": args.profile_lr,
         "profile_energy_probes": args.profile_energy_probes,
-        "posterior_t_min": args.posterior_t_min,
-        "posterior_t_max": args.posterior_t_max,
-        "nuisance_var_floor": args.nuisance_var_floor,
-        "nuisance_var_scale": args.nuisance_var_scale,
     }
     state = to_plain_dict(profile)
     for key, value in overrides.items():
@@ -172,7 +158,15 @@ def score_path(
     print(f"[score] {name}: {path}")
     _, loader = make_loader(path, channels, scaler, data_cfg, infer_cfg, device)
     scores = score_dataloader(model, loader, schedule, infer_cfg, device, dataset_name=name)
-    scores.to_csv(output_dir / f"{safe_name(name)}_scores.csv", index=False)
+    stem = safe_name(name)
+    if "z_star" in scores.attrs and "delta_star" in scores.attrs:
+        z_path = output_dir / f"{stem}_z_star.npy"
+        delta_path = output_dir / f"{stem}_delta_star.npy"
+        np.save(z_path, scores.attrs["z_star"])
+        np.save(delta_path, scores.attrs["delta_star"])
+        scores["z_star_path"] = str(z_path)
+        scores["delta_star_path"] = str(delta_path)
+    scores.to_csv(output_dir / f"{stem}_scores.csv", index=False)
     return scores
 
 
@@ -191,6 +185,43 @@ def threshold_from_val(val_scores: pd.DataFrame, q: float) -> dict[str, Any]:
         "score_p99": float(np.quantile(scores, 0.99)),
         "score_max": float(np.max(scores)),
     }
+
+
+def metrics_by_label(scores: pd.DataFrame, tau: float, split_name: str, path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    normal = scores[~scores["anomaly"].astype(bool)]
+    if not normal.empty:
+        alarms = normal["score"].to_numpy(dtype=np.float64) > float(tau)
+        rows.append({
+            "split": f"{split_name}_normal",
+            "parent_split": split_name,
+            "path": str(path),
+            "label_subset": "normal",
+            "n_samples": int(len(normal)),
+            "tau": float(tau),
+            "FAR": float(alarms.mean()),
+            "false_alarm_count": int(alarms.sum()),
+            "score_mean": float(normal["score"].mean()),
+            "score_median": float(normal["score"].median()),
+            "nuisance_code_mean": float(normal["nuisance_code"].mean()),
+        })
+    anomaly = scores[scores["anomaly"].astype(bool)]
+    if not anomaly.empty:
+        alarms = anomaly["score"].to_numpy(dtype=np.float64) > float(tau)
+        rows.append({
+            "split": f"{split_name}_anomaly",
+            "parent_split": split_name,
+            "path": str(path),
+            "label_subset": "anomaly",
+            "n_samples": int(len(anomaly)),
+            "tau": float(tau),
+            "TPR": float(alarms.mean()),
+            "true_positive_count": int(alarms.sum()),
+            "score_mean": float(anomaly["score"].mean()),
+            "score_median": float(anomaly["score"].median()),
+            "nuisance_code_mean": float(anomaly["nuisance_code"].mean()),
+        })
+    return rows
 
 
 def add_clean_reference(metrics_rows: list[dict[str, Any]], clean_name: str = "clean_test") -> list[dict[str, Any]]:
@@ -253,6 +284,8 @@ def main() -> None:
     data_cfg = dataclass_from_dict(DataConfig, cfg_state.get("data"))
     model_cfg = dataclass_from_dict(ModelConfig, cfg_state.get("model"))
     diffusion_cfg = dataclass_from_dict(DiffusionConfig, cfg_state.get("diffusion"))
+    if args.likelihood_steps is not None:
+        diffusion_cfg.likelihood_steps = args.likelihood_steps
     data_cfg.num_workers = args.num_workers
     data_cfg.pin_memory = device.type == "cuda"
     data_cfg.persistent_workers = args.num_workers > 0
@@ -274,9 +307,12 @@ def main() -> None:
     channels = list(checkpoint["channels"])
     scaler = StandardScalerStats.from_state_dict(checkpoint["scaler"])
     model_cfg.input_channels = len(channels)
+    model_cfg.beta_min = diffusion_cfg.beta_min
+    model_cfg.beta_max = diffusion_cfg.beta_max
+    model_cfg.t_eps = diffusion_cfg.t_eps
     model = ScoreTransformer(model_cfg).to(device)
     model.load_state_dict(checkpoint["model_state"], strict=True)
-    if not args.use_raw_weights and "ema_state" in checkpoint:
+    if "ema_state" in checkpoint:
         ModelEMA.apply_to(model, checkpoint["ema_state"])
         weight_source = "ema_state"
     else:
@@ -328,6 +364,7 @@ def main() -> None:
         score_tables[name] = scores
         row = {"split": name, "path": str(path), **metrics_at_tau(scores, tau)}
         metrics_rows.append(row)
+        metrics_rows.extend(metrics_by_label(scores, tau, name, path))
         print(
             f"[metrics] {name} FAR={row.get('FAR', float('nan')):.4f} "
             f"TPR={row.get('TPR', float('nan')):.4f} AUROC={row.get('AUROC', float('nan')):.4f}"

@@ -29,7 +29,7 @@ class DataConfig:
     pin_memory: bool = True
     persistent_workers: bool = True
     scaler_eps: float = 1e-6
-    normalize_clip: float | None = 12.0
+    normalize_clip: float | None = None
     limit_train_samples: int | None = None
     limit_eval_samples: int | None = None
 
@@ -43,7 +43,9 @@ class ModelConfig:
     heads: int = 5
     ff_mult: int = 4
     dropout: float = 0.05
-    conv_kernel: int = 5
+    beta_min: float = 0.1
+    beta_max: float = 20.0
+    t_eps: float = 1e-4
 
 
 @dataclass
@@ -51,26 +53,17 @@ class DiffusionConfig:
     beta_min: float = 0.1
     beta_max: float = 20.0
     t_eps: float = 1e-4
-    train_time_sampling: str = "logsnr_uniform"
     likelihood_steps: int = 24
-    likelihood_hutchinson_probes: int = 1
 
 
 @dataclass
 class ProfileConfig:
     score_probes: int = 8
     score_chunk: int = 4
-    posterior_probes: int = 4
-    posterior_chunk: int = 4
-    posterior_t_min: float = 0.10
-    posterior_t_max: float = 0.70
-    nuisance_var_floor: float = 0.05
-    nuisance_var_scale: float = 1.0
     profile_steps: int = 14
     profile_lr: float = 0.08
     profile_energy_probes: int = 4
-    profile_clip: float = 16.0
-    profile_score_mode: str = "profiled"
+    nuisance_time_steps: int = 8
 
 
 @dataclass
