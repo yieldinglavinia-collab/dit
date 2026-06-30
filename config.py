@@ -1,4 +1,4 @@
-"""Configuration for CCSD-QKV v1."""
+"""Configuration and path helpers for TNP-Diffusion v1."""
 
 from __future__ import annotations
 
@@ -10,23 +10,21 @@ from typing import Any
 PROJECT_DIR = Path("/mnt/disk2/CaiShenghao/ITS/DataDrift")
 DATA_DIR = PROJECT_DIR / "data"
 SPLITS_DIR = DATA_DIR / "splits"
-Q099_DRIFTED_DIR = DATA_DIR / "drifted_test_sets"
+DRIFTED_DIR = DATA_DIR / "drifted_test_sets"
+DEFAULT_OUTPUT_DIR = DATA_DIR / "outputs" / "ours_v1_tnp_diffusion"
 
 DEFAULT_TRAIN_PATH = SPLITS_DIR / "train_normal.parquet"
 DEFAULT_VAL_PATH = SPLITS_DIR / "val_normal.parquet"
 DEFAULT_CLEAN_TEST_PATH = SPLITS_DIR / "test.parquet"
-DEFAULT_OUTPUT_DIR = DATA_DIR / "outputs" / "ours_v1_ccsd_qkv"
 
 META_COLUMNS = ("time", "sample", "anomaly", "category", "setting", "action", "active")
-SEVERITIES = ("mild", "medium", "severe")
 SCENARIOS = ("P1", "P2", "P3", "P4", "P5")
+SEVERITIES = ("mild", "medium", "severe")
 
 
 @dataclass
 class DataConfig:
-    """Data loading and preprocessing configuration."""
-
-    target_length: int = 512
+    target_length: int = 384
     num_workers: int = 4
     pin_memory: bool = True
     persistent_workers: bool = True
@@ -38,74 +36,75 @@ class DataConfig:
 
 @dataclass
 class ModelConfig:
-    """Transformer denoiser configuration."""
-
     input_channels: int = 58
-    target_length: int = 512
-    model_dim: int = 128
-    depth: int = 4
-    heads: int = 4
+    target_length: int = 384
+    model_dim: int = 160
+    depth: int = 5
+    heads: int = 5
     ff_mult: int = 4
-    sigma_embed_dim: int = 128
     dropout: float = 0.05
+    conv_kernel: int = 5
 
 
 @dataclass
 class DiffusionConfig:
-    """Continuous-noise conditional denoising configuration."""
+    beta_min: float = 0.1
+    beta_max: float = 20.0
+    t_eps: float = 1e-4
+    train_time_sampling: str = "logsnr_uniform"
+    likelihood_steps: int = 24
+    likelihood_hutchinson_probes: int = 1
 
-    sigma_min: float = 0.02
-    sigma_max: float = 1.0
-    train_mask_ratio: float = 0.25
-    eval_mask_ratio: float = 0.25
-    mask_strategy: str = "mixed"
-    element_mask_prob: float = 0.50
-    time_block_mask_prob: float = 0.25
-    patch_mask_prob: float = 0.25
-    min_time_block: int = 16
-    max_time_block: int = 96
-    patch_channel_fraction: float = 0.35
+
+@dataclass
+class ProfileConfig:
+    score_probes: int = 8
+    score_chunk: int = 4
+    posterior_probes: int = 4
+    posterior_chunk: int = 4
+    posterior_t_min: float = 0.10
+    posterior_t_max: float = 0.70
+    nuisance_var_floor: float = 0.05
+    nuisance_var_scale: float = 1.0
+    profile_steps: int = 14
+    profile_lr: float = 0.08
+    profile_energy_probes: int = 4
+    profile_clip: float = 16.0
+    profile_score_mode: str = "profiled"
 
 
 @dataclass
 class TrainConfig:
-    """Optimization configuration."""
-
     seed: int = 177
     epochs: int = 120
     batch_size: int = 32
     lr: float = 2e-4
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
+    ema_decay: float = 0.999
     amp: bool = True
     amp_dtype: str = "float16"
     device: str = "cuda"
-    ema_decay: float = 0.999
     log_interval: int = 20
     save_every: int = 20
     output_dir: str = str(DEFAULT_OUTPUT_DIR)
-    run_name: str = "ccsd_qkv_v1"
+    run_name: str = "tnp_diffusion_v1"
 
 
 @dataclass
 class InferenceConfig:
-    """Inference and evaluation configuration."""
-
     seed: int = 177
-    batch_size: int = 32
-    mc_samples: int = 32
-    mc_chunk: int = 4
     threshold_q: float = 0.99
+    batch_size: int = 16
     amp: bool = True
     amp_dtype: str = "float16"
     device: str = "cuda"
-    output_dir: str = str(DEFAULT_OUTPUT_DIR / "inference")
+    output_dir: str = str(DEFAULT_OUTPUT_DIR / "inference_q099")
+    profile: ProfileConfig = field(default_factory=ProfileConfig)
 
 
 @dataclass
 class ExperimentConfig:
-    """Serializable experiment configuration saved in checkpoints."""
-
     train_path: str = str(DEFAULT_TRAIN_PATH)
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
@@ -117,42 +116,36 @@ class ExperimentConfig:
         return to_plain_dict(self)
 
 
-def to_plain_dict(obj: Any) -> Any:
-    """Converts nested dataclasses and paths into JSON-friendly objects."""
-    if is_dataclass(obj):
-        return {key: to_plain_dict(value) for key, value in asdict(obj).items()}
-    if isinstance(obj, Path):
-        return str(obj)
-    if isinstance(obj, dict):
-        return {str(key): to_plain_dict(value) for key, value in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [to_plain_dict(value) for value in obj]
-    return obj
+def to_plain_dict(value: Any) -> Any:
+    if is_dataclass(value):
+        return {key: to_plain_dict(item) for key, item in asdict(value).items()}
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): to_plain_dict(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_plain_dict(item) for item in value]
+    return value
 
 
 def ensure_dir(path: str | Path) -> Path:
-    """Creates and returns a directory path."""
     result = Path(path)
     result.mkdir(parents=True, exist_ok=True)
     return result
 
 
 def parse_eval_pairs(values: list[str]) -> dict[str, Path]:
-    """Parses CLI values of the form NAME=/path/to/file.parquet."""
     parsed: dict[str, Path] = {}
-    for item in values:
-        if "=" not in item:
-            raise ValueError(f"Expected NAME=/path/to/file.parquet, got: {item}")
-        name, path = item.split("=", 1)
-        if not name:
-            raise ValueError(f"Empty dataset name in eval argument: {item}")
+    for value in values:
+        if "=" not in value:
+            raise ValueError(f"Expected NAME=/path/to/file.parquet, got {value}")
+        name, path = value.split("=", 1)
         parsed[name] = Path(path)
     return parsed
 
 
-def q099_eval_paths(clean_test_path: Path = DEFAULT_CLEAN_TEST_PATH, drifted_dir: Path = Q099_DRIFTED_DIR) -> dict[str, Path]:
-    """Builds standard q=0.99 clean and drifted mixed-test eval paths."""
-    paths: dict[str, Path] = {"clean_test": Path(clean_test_path)}
+def q099_mixed_eval_paths(clean_test_path: Path = DEFAULT_CLEAN_TEST_PATH, drifted_dir: Path = DRIFTED_DIR) -> dict[str, Path]:
+    paths = {"clean_test": Path(clean_test_path)}
     for scenario in SCENARIOS:
         for severity in SEVERITIES:
             paths[f"{scenario}_{severity}"] = Path(drifted_dir) / f"{scenario}_{severity}_test.parquet"

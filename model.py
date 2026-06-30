@@ -1,4 +1,4 @@
-"""CCSD-QKV denoising Transformer."""
+"""Score network for TNP-Diffusion."""
 
 from __future__ import annotations
 
@@ -11,74 +11,61 @@ import torch.nn.functional as F
 from config import ModelConfig
 
 
-def sinusoidal_scalar_embedding(values: torch.Tensor, dim: int) -> torch.Tensor:
-    """Builds a sinusoidal embedding for a scalar tensor of shape [B]."""
+def scalar_sinusoidal_embedding(values: torch.Tensor, dim: int) -> torch.Tensor:
     half = dim // 2
     exponent = -math.log(10000.0) / max(half - 1, 1)
     frequencies = torch.exp(torch.arange(half, device=values.device, dtype=torch.float32) * exponent)
     angles = values.float().unsqueeze(1) * frequencies.unsqueeze(0)
-    embedding = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)
+    emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)
     if dim % 2 == 1:
-        embedding = F.pad(embedding, (0, 1))
-    return embedding
+        emb = F.pad(emb, (0, 1))
+    return emb
 
 
-class SigmaEmbedding(nn.Module):
-    """MLP embedding of log sigma."""
-
-    def __init__(self, embed_dim: int):
+class TimeEmbedding(nn.Module):
+    def __init__(self, dim: int):
         super().__init__()
-        self.embed_dim = embed_dim
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 2),
+        self.dim = dim
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim * 4),
             nn.SiLU(),
-            nn.Linear(embed_dim * 2, embed_dim),
+            nn.Linear(dim * 4, dim),
         )
 
-    def forward(self, sigma: torch.Tensor) -> torch.Tensor:
-        log_sigma = torch.log(torch.clamp(sigma.float(), min=1e-8))
-        return self.mlp(sinusoidal_scalar_embedding(log_sigma, self.embed_dim))
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        logsnr_like = torch.logit(t.clamp(1e-5, 1.0 - 1e-5))
+        return self.net(scalar_sinusoidal_embedding(logsnr_like, self.dim))
 
 
-class SigmaAdaLN(nn.Module):
-    """LayerNorm modulated by a per-sample sigma embedding."""
-
-    def __init__(self, dim: int, sigma_dim: int):
+class AdaLN(nn.Module):
+    def __init__(self, dim: int):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
-        self.modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(sigma_dim, dim * 2),
-        )
-        nn.init.zeros_(self.modulation[-1].weight)
-        nn.init.zeros_(self.modulation[-1].bias)
+        self.mod = nn.Sequential(nn.SiLU(), nn.Linear(dim, 2 * dim))
+        nn.init.zeros_(self.mod[-1].weight)
+        nn.init.zeros_(self.mod[-1].bias)
 
-    def forward(self, x: torch.Tensor, sigma_emb: torch.Tensor) -> torch.Tensor:
-        shift, scale = self.modulation(sigma_emb).chunk(2, dim=-1)
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        shift, scale = self.mod(cond).chunk(2, dim=-1)
         return self.norm(x) * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
-class SigmaConditionedQKVAttention(nn.Module):
-    """Full self-attention with log-sigma-conditioned Q/K/V representations."""
-
-    def __init__(self, dim: int, heads: int, sigma_dim: int, dropout: float):
+class StandardAttention(nn.Module):
+    def __init__(self, dim: int, heads: int, dropout: float):
         super().__init__()
         if dim % heads != 0:
             raise ValueError(f"model_dim={dim} must be divisible by heads={heads}")
         self.heads = heads
         self.head_dim = dim // heads
-        self.adaln = SigmaAdaLN(dim, sigma_dim)
-        self.qkv = nn.Linear(dim, dim * 3)
+        self.qkv = nn.Linear(dim, 3 * dim)
         self.out = nn.Linear(dim, dim)
         self.dropout = float(dropout)
 
-    def forward(self, x: torch.Tensor, sigma_emb: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, length, dim = x.shape
-        h = self.adaln(x, sigma_emb)
-        qkv = self.qkv(h).view(batch, length, 3, self.heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
+        qkv = self.qkv(x).view(batch, length, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        attn = F.scaled_dot_product_attention(
+        y = F.scaled_dot_product_attention(
             q,
             k,
             v,
@@ -86,80 +73,59 @@ class SigmaConditionedQKVAttention(nn.Module):
             dropout_p=self.dropout if self.training else 0.0,
             is_causal=False,
         )
-        attn = attn.transpose(1, 2).contiguous().view(batch, length, dim)
-        return self.out(attn)
+        return self.out(y.transpose(1, 2).contiguous().view(batch, length, dim))
 
 
-class SigmaConditionedFFN(nn.Module):
-    """Feed-forward block with sigma-conditioned normalization."""
-
-    def __init__(self, dim: int, sigma_dim: int, ff_mult: int, dropout: float):
-        super().__init__()
-        self.adaln = SigmaAdaLN(dim, sigma_dim)
-        hidden = dim * ff_mult
-        self.net = nn.Sequential(
-            nn.Linear(dim, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, dim),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x: torch.Tensor, sigma_emb: torch.Tensor) -> torch.Tensor:
-        return self.net(self.adaln(x, sigma_emb))
-
-
-class CCSDQKVBlock(nn.Module):
-    """Residual Transformer block."""
-
+class TNPBlock(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
-        self.attn = SigmaConditionedQKVAttention(
-            dim=cfg.model_dim,
-            heads=cfg.heads,
-            sigma_dim=cfg.sigma_embed_dim,
-            dropout=cfg.dropout,
-        )
-        self.ffn = SigmaConditionedFFN(
-            dim=cfg.model_dim,
-            sigma_dim=cfg.sigma_embed_dim,
-            ff_mult=cfg.ff_mult,
-            dropout=cfg.dropout,
+        self.attn_norm = AdaLN(cfg.model_dim)
+        self.attn = StandardAttention(cfg.model_dim, cfg.heads, cfg.dropout)
+        self.ff_norm = AdaLN(cfg.model_dim)
+        hidden = cfg.model_dim * cfg.ff_mult
+        self.ff = nn.Sequential(
+            nn.Linear(cfg.model_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(hidden, cfg.model_dim),
+            nn.Dropout(cfg.dropout),
         )
 
-    def forward(self, x: torch.Tensor, sigma_emb: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(x, sigma_emb)
-        x = x + self.ffn(x, sigma_emb)
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.attn_norm(x, cond))
+        x = x + self.ff(self.ff_norm(x, cond))
         return x
 
 
-class CCSDQKVDenoiser(nn.Module):
-    """Cycle-conditional score diffusion denoiser with Q/K/V sigma conditioning."""
+class ScoreTransformer(nn.Module):
+    """Transformer epsilon-prediction score network over time tokens."""
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
-        token_dim = cfg.input_channels * 2
-        self.input_proj = nn.Linear(token_dim, cfg.model_dim)
+        self.input_norm = nn.LayerNorm(cfg.input_channels)
+        self.input_proj = nn.Linear(cfg.input_channels, cfg.model_dim)
+        self.local_conv = nn.Sequential(
+            nn.Conv1d(cfg.model_dim, cfg.model_dim, kernel_size=cfg.conv_kernel, padding=cfg.conv_kernel // 2, groups=cfg.model_dim),
+            nn.GELU(),
+            nn.Conv1d(cfg.model_dim, cfg.model_dim, kernel_size=1),
+        )
         self.position = nn.Parameter(torch.zeros(1, cfg.target_length, cfg.model_dim))
         nn.init.trunc_normal_(self.position, std=0.02)
-        self.sigma_embedding = SigmaEmbedding(cfg.sigma_embed_dim)
-        self.blocks = nn.ModuleList([CCSDQKVBlock(cfg) for _ in range(cfg.depth)])
+        self.time_embedding = TimeEmbedding(cfg.model_dim)
+        self.blocks = nn.ModuleList([TNPBlock(cfg) for _ in range(cfg.depth)])
         self.final_norm = nn.LayerNorm(cfg.model_dim)
         self.out = nn.Linear(cfg.model_dim, cfg.input_channels)
 
-    def forward(self, noised_context: torch.Tensor, target_mask: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-        """Predicts epsilon for [B, T, C] noised/context inputs."""
-        if noised_context.shape != target_mask.shape:
-            raise ValueError("noised_context and target_mask must have the same shape.")
-        if noised_context.shape[1] > self.position.shape[1]:
-            raise ValueError("Input length exceeds configured target_length.")
-        sigma_emb = self.sigma_embedding(sigma)
-        tokens = torch.cat([noised_context, target_mask.float()], dim=-1)
-        h = self.input_proj(tokens)
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if x_t.shape[1] > self.position.shape[1]:
+            raise ValueError(f"Input length {x_t.shape[1]} exceeds configured target_length {self.position.shape[1]}.")
+        cond = self.time_embedding(t)
+        h = self.input_proj(self.input_norm(x_t))
+        h = h + self.local_conv(h.transpose(1, 2)).transpose(1, 2)
         h = h + self.position[:, : h.shape[1]]
         for block in self.blocks:
-            h = block(h, sigma_emb)
+            h = block(h, cond)
         return self.out(self.final_norm(h))
 
     def parameter_count(self) -> int:

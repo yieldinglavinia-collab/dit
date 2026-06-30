@@ -1,16 +1,13 @@
-#!/usr/bin/env python3
-"""Train CCSD-QKV on clean train_normal only."""
+"""Train TNP-Diffusion on clean normal cycles only."""
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
+import time
 from pathlib import Path
+from typing import Any
 
 import torch
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from tqdm.auto import tqdm
 
 from config import (
     DEFAULT_OUTPUT_DIR,
@@ -18,68 +15,137 @@ from config import (
     DataConfig,
     DiffusionConfig,
     ExperimentConfig,
-    InferenceConfig,
     ModelConfig,
     TrainConfig,
     ensure_dir,
+    to_plain_dict,
 )
-from data import (
-    create_dataloader,
-    fit_standard_scaler_from_parquet,
-    infer_measurement_columns,
-    load_cycle_tensors,
-)
-from engine import ModelEMA, resolve_device, save_json, set_seed, train_one_epoch
-from model import CCSDQKVDenoiser
+from data import create_dataloader, fit_standard_scaler, infer_measurement_columns, load_cycle_tensors
+from engine import ModelEMA, VPSchedule, save_json, set_seed, train_one_epoch
+from model import ScoreTransformer
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description="Train measurement-only TNP-Diffusion on train_normal.parquet.")
     parser.add_argument("--train-path", type=Path, default=DEFAULT_TRAIN_PATH)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--run-name", default="ccsd_qkv_v1")
-    parser.add_argument("--target-length", type=int, default=512)
+    parser.add_argument("--run-name", type=str, default="tnp_diffusion_v1")
+
+    parser.add_argument("--target-length", type=int, default=384)
+    parser.add_argument("--limit-train-samples", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--normalize-clip", type=float, default=12.0)
+
+    parser.add_argument("--model-dim", type=int, default=160)
+    parser.add_argument("--depth", type=int, default=5)
+    parser.add_argument("--heads", type=int, default=5)
+    parser.add_argument("--ff-mult", type=int, default=4)
+    parser.add_argument("--dropout", type=float, default=0.05)
+    parser.add_argument("--conv-kernel", type=int, default=5)
+
+    parser.add_argument("--beta-min", type=float, default=0.1)
+    parser.add_argument("--beta-max", type=float, default=20.0)
+    parser.add_argument("--t-eps", type=float, default=1e-4)
+
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--model-dim", type=int, default=128)
-    parser.add_argument("--depth", type=int, default=4)
-    parser.add_argument("--heads", type=int, default=4)
-    parser.add_argument("--dropout", type=float, default=0.05)
-    parser.add_argument("--train-mask-ratio", type=float, default=0.25)
-    parser.add_argument("--eval-mask-ratio", type=float, default=0.25)
-    parser.add_argument("--sigma-min", type=float, default=0.02)
-    parser.add_argument("--sigma-max", type=float, default=1.0)
-    parser.add_argument("--mask-strategy", choices=("element", "time_block", "patch", "mixed"), default="mixed")
-    parser.add_argument("--seed", type=int, default=177)
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--amp", action="store_true", default=True)
-    parser.add_argument("--no-amp", dest="amp", action="store_false")
-    parser.add_argument("--amp-dtype", choices=("float16", "bfloat16"), default="float16")
+    parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--ema-decay", type=float, default=0.999)
+    parser.add_argument("--seed", type=int, default=177)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--amp", dest="amp", action="store_true", default=True)
+    parser.add_argument("--no-amp", dest="amp", action="store_false")
+    parser.add_argument("--amp-dtype", type=str, choices=("float16", "bfloat16"), default="float16")
+    parser.add_argument("--log-interval", type=int, default=20)
     parser.add_argument("--save-every", type=int, default=20)
-    parser.add_argument("--limit-train-samples", type=int, default=None)
     return parser
+
+
+def resolve_device(name: str) -> torch.device:
+    if name == "cuda" and not torch.cuda.is_available():
+        print("[warn] CUDA was requested but is not available; falling back to CPU.")
+        return torch.device("cpu")
+    return torch.device(name)
+
+
+def configure_torch(device: torch.device) -> None:
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+
+
+def make_optimizer(model: torch.nn.Module, train_cfg: TrainConfig) -> torch.optim.Optimizer:
+    try:
+        return torch.optim.AdamW(
+            model.parameters(),
+            lr=train_cfg.lr,
+            weight_decay=train_cfg.weight_decay,
+            betas=(0.9, 0.95),
+            fused=train_cfg.device == "cuda" and torch.cuda.is_available(),
+        )
+    except TypeError:
+        return torch.optim.AdamW(
+            model.parameters(),
+            lr=train_cfg.lr,
+            weight_decay=train_cfg.weight_decay,
+            betas=(0.9, 0.95),
+        )
+
+
+def checkpoint_payload(
+    model: ScoreTransformer,
+    ema: ModelEMA,
+    scaler_state: dict[str, Any],
+    channels: list[str],
+    cfg: ExperimentConfig,
+    history: list[dict[str, Any]],
+    epoch: int,
+) -> dict[str, Any]:
+    return {
+        "epoch": int(epoch),
+        "model_state": model.state_dict(),
+        "ema_state": ema.state_dict(),
+        "scaler": scaler_state,
+        "channels": channels,
+        "config": cfg.to_dict(),
+        "history": history,
+    }
+
+
+def save_checkpoint(
+    path: Path,
+    model: ScoreTransformer,
+    ema: ModelEMA,
+    scaler_state: dict[str, Any],
+    channels: list[str],
+    cfg: ExperimentConfig,
+    history: list[dict[str, Any]],
+    epoch: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(checkpoint_payload(model, ema, scaler_state, channels, cfg, history, epoch), path)
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    torch.set_float32_matmul_precision("high")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-
     device = resolve_device(args.device)
+    configure_torch(device)
     set_seed(args.seed)
 
-    channels = infer_measurement_columns(args.train_path)
-    if len(channels) != 58:
-        raise RuntimeError(f"Expected 58 measurement channels, found {len(channels)}.")
+    run_dir = ensure_dir(Path(args.output_dir) / args.run_name)
+    print(f"[info] output_dir={run_dir}")
+    print(f"[info] train_path={args.train_path}")
 
+    channels = infer_measurement_columns(args.train_path)
     data_cfg = DataConfig(
         target_length=args.target_length,
         num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
+        normalize_clip=args.normalize_clip,
         limit_train_samples=args.limit_train_samples,
     )
     model_cfg = ModelConfig(
@@ -88,121 +154,93 @@ def main() -> None:
         model_dim=args.model_dim,
         depth=args.depth,
         heads=args.heads,
+        ff_mult=args.ff_mult,
         dropout=args.dropout,
-        sigma_embed_dim=args.model_dim,
+        conv_kernel=args.conv_kernel,
     )
-    diffusion_cfg = DiffusionConfig(
-        sigma_min=args.sigma_min,
-        sigma_max=args.sigma_max,
-        train_mask_ratio=args.train_mask_ratio,
-        eval_mask_ratio=args.eval_mask_ratio,
-        mask_strategy=args.mask_strategy,
-    )
+    diffusion_cfg = DiffusionConfig(beta_min=args.beta_min, beta_max=args.beta_max, t_eps=args.t_eps)
     train_cfg = TrainConfig(
         seed=args.seed,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
         weight_decay=args.weight_decay,
+        grad_clip=args.grad_clip,
+        ema_decay=args.ema_decay,
         amp=args.amp,
         amp_dtype=args.amp_dtype,
         device=str(device),
-        ema_decay=args.ema_decay,
+        log_interval=args.log_interval,
         save_every=args.save_every,
         output_dir=str(args.output_dir),
         run_name=args.run_name,
     )
-    inference_cfg = replace(InferenceConfig(), device=str(device), amp=args.amp, amp_dtype=args.amp_dtype)
-    exp_cfg = ExperimentConfig(
+    cfg = ExperimentConfig(
         train_path=str(args.train_path),
         data=data_cfg,
         model=model_cfg,
         diffusion=diffusion_cfg,
         train=train_cfg,
-        inference=inference_cfg,
     )
+    save_json(run_dir / "config.json", cfg.to_dict())
 
-    print("Fitting train_normal StandardScaler...")
-    scaler = fit_standard_scaler_from_parquet(
+    print("[info] fitting StandardScaler from train_normal only")
+    scaler = fit_standard_scaler(
         args.train_path,
-        channels=channels,
+        channels,
         eps=data_cfg.scaler_eps,
         clip=data_cfg.normalize_clip,
-        limit_samples=args.limit_train_samples,
+        limit_samples=data_cfg.limit_train_samples,
     )
-    print("Loading fixed-length train cycles...")
-    train_tensors = load_cycle_tensors(
+    print("[info] loading train cycles")
+    tensors = load_cycle_tensors(
         args.train_path,
-        channels=channels,
-        scaler=scaler,
-        target_length=args.target_length,
-        limit_samples=args.limit_train_samples,
+        channels,
+        scaler,
+        target_length=data_cfg.target_length,
+        limit_samples=data_cfg.limit_train_samples,
     )
     loader = create_dataloader(
-        train_tensors.to_dataset(),
-        batch_size=args.batch_size,
+        tensors.to_dataset(),
+        batch_size=train_cfg.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=data_cfg.num_workers,
         pin_memory=data_cfg.pin_memory,
         persistent_workers=data_cfg.persistent_workers,
     )
 
-    model = CCSDQKVDenoiser(model_cfg).to(device)
-    print(f"Model parameters: {model.parameter_count():,}")
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=device.type == "cuda")
-    scheduler = CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
-    ema = ModelEMA(model, decay=args.ema_decay) if args.ema_decay > 0.0 else None
+    model = ScoreTransformer(model_cfg).to(device)
+    print(f"[info] model_params={model.parameter_count():,}")
+    optimizer = make_optimizer(model, train_cfg)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(train_cfg.epochs, 1))
+    ema = ModelEMA(model, decay=train_cfg.ema_decay)
+    schedule = VPSchedule(diffusion_cfg)
 
-    output_dir = ensure_dir(args.output_dir / args.run_name)
-    save_json(output_dir / "config.json", exp_cfg.to_dict())
-    history: list[dict[str, float]] = []
-
-    epoch_bar = tqdm(range(1, args.epochs + 1), desc="epochs")
-    for epoch in epoch_bar:
-        metrics = train_one_epoch(
-            model=model,
-            loader=loader,
-            optimizer=optimizer,
-            diffusion_cfg=diffusion_cfg,
-            train_cfg=train_cfg,
-            device=device,
-            ema=ema,
-            epoch=epoch,
-        )
+    history: list[dict[str, Any]] = []
+    start_time = time.time()
+    scaler_state = scaler.to_state_dict()
+    for epoch in range(1, train_cfg.epochs + 1):
+        metrics = train_one_epoch(model, loader, optimizer, schedule, train_cfg, device, ema, epoch)
         scheduler.step()
-        metrics["epoch"] = epoch
-        metrics["lr"] = float(optimizer.param_groups[0]["lr"])
-        history.append(metrics)
-        epoch_bar.set_postfix(loss=f"{metrics['loss']:.4f}", lr=f"{metrics['lr']:.2e}")
+        row = {
+            "epoch": epoch,
+            "lr": float(scheduler.get_last_lr()[0]),
+            "elapsed_sec": float(time.time() - start_time),
+            **metrics,
+        }
+        history.append(row)
+        print(
+            f"[epoch {epoch:03d}] loss={row['loss']:.6f} eps_mse={row['eps_mse']:.6f} "
+            f"t_mean={row['t_mean']:.4f} lr={row['lr']:.3e}"
+        )
+        save_json(run_dir / "train_history.json", history)
+        if epoch % train_cfg.save_every == 0 or epoch == train_cfg.epochs:
+            save_checkpoint(run_dir / f"checkpoint_epoch_{epoch:03d}.pt", model, ema, scaler_state, channels, cfg, history, epoch)
+            save_checkpoint(run_dir / "checkpoint_last.pt", model, ema, scaler_state, channels, cfg, history, epoch)
 
-        if args.save_every > 0 and epoch % args.save_every == 0:
-            save_checkpoint(output_dir / f"checkpoint_epoch_{epoch:04d}.pt", model, ema, scaler, channels, exp_cfg, history)
-
-    checkpoint_path = output_dir / "checkpoint.pt"
-    save_checkpoint(checkpoint_path, model, ema, scaler, channels, exp_cfg, history)
-    save_json(output_dir / "train_history.json", {"history": history})
-    print(f"Saved checkpoint: {checkpoint_path}")
-    print(f"Saved history: {output_dir / 'train_history.json'}")
-
-
-def save_checkpoint(
-    path: Path,
-    model: CCSDQKVDenoiser,
-    ema: ModelEMA | None,
-    scaler,
-    channels: list[str],
-    exp_cfg: ExperimentConfig,
-    history: list[dict[str, float]],
-) -> None:
-    checkpoint = {
-        "model_state": model.state_dict(),
-        "ema_state": ema.state_dict() if ema is not None else None,
-        "scaler": scaler.to_state_dict(),
-        "channels": channels,
-        "config": exp_cfg.to_dict(),
-        "history": history,
-    }
-    torch.save(checkpoint, path)
+    save_checkpoint(run_dir / "checkpoint_final.pt", model, ema, scaler_state, channels, cfg, history, train_cfg.epochs)
+    save_json(run_dir / "train_summary.json", {"run_dir": str(run_dir), "config": to_plain_dict(cfg), "history": history})
+    print(f"[done] final_checkpoint={run_dir / 'checkpoint_final.pt'}")
 
 
 if __name__ == "__main__":

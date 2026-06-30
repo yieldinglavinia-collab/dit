@@ -1,4 +1,4 @@
-"""Data loading, fixed-length resampling, and train-only scaling for CCSD-QKV."""
+"""Measurement-only parquet loading and fixed-length cycle tensors."""
 
 from __future__ import annotations
 
@@ -16,8 +16,6 @@ from config import META_COLUMNS
 
 @dataclass
 class StandardScalerStats:
-    """Channel-wise standardization statistics fitted on train_normal only."""
-
     mean: torch.Tensor
     scale: torch.Tensor
     channels: list[str]
@@ -54,8 +52,6 @@ class StandardScalerStats:
 
 @dataclass
 class CycleTensors:
-    """Tensor package for fixed-length robot cycles."""
-
     values: torch.Tensor
     sample_ids: torch.Tensor
     anomaly: torch.Tensor
@@ -69,8 +65,6 @@ class CycleTensors:
 
 
 class CycleDataset(Dataset):
-    """Tensor-backed dataset returning one fixed-length cycle at a time."""
-
     def __init__(self, tensors: CycleTensors):
         self.tensors = tensors
 
@@ -92,28 +86,29 @@ def read_parquet(path: str | Path, columns: list[str] | None = None) -> pd.DataF
     return pd.read_parquet(path, columns=columns, engine="fastparquet")
 
 
-def infer_measurement_columns(parquet_path: str | Path) -> list[str]:
-    """Returns all non-metadata columns from the measured parquet schema."""
-    frame = read_parquet(parquet_path)
-    return [column for column in frame.columns if column not in META_COLUMNS]
+def infer_measurement_columns(path: str | Path) -> list[str]:
+    frame = read_parquet(path)
+    channels = [column for column in frame.columns if column not in META_COLUMNS]
+    if len(channels) != 58:
+        raise RuntimeError(f"Expected 58 measurement columns, found {len(channels)}.")
+    return channels
 
 
-def fit_standard_scaler_from_parquet(
-    parquet_path: str | Path,
+def fit_standard_scaler(
+    path: str | Path,
     channels: Sequence[str],
-    eps: float = 1e-6,
-    clip: float | None = 12.0,
+    eps: float,
+    clip: float | None,
     limit_samples: int | None = None,
 ) -> StandardScalerStats:
-    """Fits channel mean/std on train_normal only."""
     columns = list(META_COLUMNS) + list(channels)
-    frame = read_parquet(parquet_path, columns=columns)
+    frame = read_parquet(path, columns=columns)
     if limit_samples is not None:
-        sample_ids = frame["sample"].drop_duplicates().iloc[:limit_samples]
-        frame = frame[frame["sample"].isin(sample_ids)]
+        keep = frame["sample"].drop_duplicates().iloc[:limit_samples]
+        frame = frame[frame["sample"].isin(keep)]
     values = frame[list(channels)].to_numpy(dtype=np.float32, copy=False)
-    mean = np.mean(values, axis=0, dtype=np.float64).astype(np.float32)
-    scale = np.std(values, axis=0, dtype=np.float64).astype(np.float32)
+    mean = values.mean(axis=0, dtype=np.float64).astype(np.float32)
+    scale = values.std(axis=0, dtype=np.float64).astype(np.float32)
     scale = np.where(scale > eps, scale, 1.0).astype(np.float32)
     return StandardScalerStats(
         mean=torch.from_numpy(mean),
@@ -125,7 +120,6 @@ def fit_standard_scaler_from_parquet(
 
 
 def resample_sequence(values: np.ndarray, target_length: int) -> np.ndarray:
-    """Resamples a [T, C] sequence to [target_length, C] using sequence order only."""
     length, channels = values.shape
     if length == target_length:
         return values.astype(np.float32, copy=False)
@@ -139,19 +133,13 @@ def resample_sequence(values: np.ndarray, target_length: int) -> np.ndarray:
     return out
 
 
-def _sample_to_array(
-    sample_frame: pd.DataFrame,
-    channels: Sequence[str],
-    scaler: StandardScalerStats,
-    target_length: int,
-) -> dict[str, Any]:
+def _sample_to_arrays(sample_frame: pd.DataFrame, channels: Sequence[str], scaler: StandardScalerStats, target_length: int) -> dict[str, Any]:
     raw = sample_frame[list(channels)].to_numpy(dtype=np.float32, copy=False)
-    normalized = scaler.normalize(raw)
-    values = resample_sequence(normalized, target_length)
+    values = resample_sequence(scaler.normalize(raw), target_length)
     first = sample_frame.iloc[0]
     return {
         "values": values,
-        "sample_id": int(first["sample"]),
+        "sample": int(first["sample"]),
         "anomaly": int(bool(first["anomaly"])),
         "category": int(first["category"]),
         "setting": int(first["setting"]),
@@ -160,29 +148,26 @@ def _sample_to_array(
 
 
 def load_cycle_tensors(
-    parquet_path: str | Path,
+    path: str | Path,
     channels: Sequence[str],
     scaler: StandardScalerStats,
     target_length: int,
     limit_samples: int | None = None,
 ) -> CycleTensors:
-    """Loads a parquet file into fixed-length cycle tensors."""
     columns = list(META_COLUMNS) + list(channels)
-    frame = read_parquet(parquet_path, columns=columns)
-    sample_ids = frame["sample"].drop_duplicates().to_list()
+    frame = read_parquet(path, columns=columns)
+    samples = frame["sample"].drop_duplicates().to_list()
     if limit_samples is not None:
-        sample_ids = sample_ids[:limit_samples]
-        frame = frame[frame["sample"].isin(sample_ids)]
-    grouped = [group for _, group in frame.groupby("sample", sort=False)]
-    arrays = [_sample_to_array(group, channels, scaler, target_length) for group in grouped]
-    values = torch.from_numpy(np.stack([item["values"] for item in arrays], axis=0)).float()
+        samples = samples[:limit_samples]
+        frame = frame[frame["sample"].isin(samples)]
+    rows = [_sample_to_arrays(group, channels, scaler, target_length) for _, group in frame.groupby("sample", sort=False)]
     return CycleTensors(
-        values=values,
-        sample_ids=torch.tensor([item["sample_id"] for item in arrays], dtype=torch.long),
-        anomaly=torch.tensor([item["anomaly"] for item in arrays], dtype=torch.bool),
-        category=torch.tensor([item["category"] for item in arrays], dtype=torch.long),
-        setting=torch.tensor([item["setting"] for item in arrays], dtype=torch.long),
-        original_lengths=torch.tensor([item["original_length"] for item in arrays], dtype=torch.long),
+        values=torch.from_numpy(np.stack([row["values"] for row in rows], axis=0)).float(),
+        sample_ids=torch.tensor([row["sample"] for row in rows], dtype=torch.long),
+        anomaly=torch.tensor([row["anomaly"] for row in rows], dtype=torch.bool),
+        category=torch.tensor([row["category"] for row in rows], dtype=torch.long),
+        setting=torch.tensor([row["setting"] for row in rows], dtype=torch.long),
+        original_lengths=torch.tensor([row["original_length"] for row in rows], dtype=torch.long),
         channels=list(channels),
     )
 
@@ -195,17 +180,16 @@ def create_dataloader(
     pin_memory: bool,
     persistent_workers: bool,
 ) -> DataLoader:
-    use_persistent = persistent_workers and num_workers > 0
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        persistent_workers=use_persistent,
+        persistent_workers=persistent_workers and num_workers > 0,
         drop_last=False,
     )
 
 
-def move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
+def move_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
     return {key: value.to(device, non_blocking=True) for key, value in batch.items()}
