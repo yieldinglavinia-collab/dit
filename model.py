@@ -23,6 +23,8 @@ def scalar_sinusoidal_embedding(values: torch.Tensor, dim: int) -> torch.Tensor:
 
 
 class TimeEmbedding(nn.Module):
+    """MLP(log sigma_t) time conditioning."""
+
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
@@ -32,9 +34,8 @@ class TimeEmbedding(nn.Module):
             nn.Linear(dim * 4, dim),
         )
 
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        logsnr_like = torch.logit(t.clamp(1e-5, 1.0 - 1e-5))
-        return self.net(scalar_sinusoidal_embedding(logsnr_like, self.dim))
+    def forward(self, log_sigma: torch.Tensor) -> torch.Tensor:
+        return self.net(scalar_sinusoidal_embedding(log_sigma, self.dim))
 
 
 class AdaLN(nn.Module):
@@ -98,35 +99,34 @@ class TNPBlock(nn.Module):
 
 
 class ScoreTransformer(nn.Module):
-    """Transformer epsilon-prediction score network over time tokens."""
+    """Plain Transformer epsilon-prediction score network over time tokens."""
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
-        self.input_norm = nn.LayerNorm(cfg.input_channels)
         self.input_proj = nn.Linear(cfg.input_channels, cfg.model_dim)
-        self.local_conv = nn.Sequential(
-            nn.Conv1d(cfg.model_dim, cfg.model_dim, kernel_size=cfg.conv_kernel, padding=cfg.conv_kernel // 2, groups=cfg.model_dim),
-            nn.GELU(),
-            nn.Conv1d(cfg.model_dim, cfg.model_dim, kernel_size=1),
-        )
-        self.position = nn.Parameter(torch.zeros(1, cfg.target_length, cfg.model_dim))
-        nn.init.trunc_normal_(self.position, std=0.02)
         self.time_embedding = TimeEmbedding(cfg.model_dim)
         self.blocks = nn.ModuleList([TNPBlock(cfg) for _ in range(cfg.depth)])
         self.final_norm = nn.LayerNorm(cfg.model_dim)
         self.out = nn.Linear(cfg.model_dim, cfg.input_channels)
 
+    def log_sigma(self, t: torch.Tensor) -> torch.Tensor:
+        t = t.clamp(self.cfg.t_eps, 1.0)
+        integral_beta = self.cfg.beta_min * t + 0.5 * (self.cfg.beta_max - self.cfg.beta_min) * t.pow(2)
+        alpha = torch.exp(-0.5 * integral_beta)
+        sigma = torch.sqrt(torch.clamp(1.0 - alpha.pow(2), min=1e-8))
+        return torch.log(sigma.clamp_min(1e-8))
+
     def forward(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        if x_t.shape[1] > self.position.shape[1]:
-            raise ValueError(f"Input length {x_t.shape[1]} exceeds configured target_length {self.position.shape[1]}.")
-        cond = self.time_embedding(t)
-        h = self.input_proj(self.input_norm(x_t))
-        h = h + self.local_conv(h.transpose(1, 2)).transpose(1, 2)
-        h = h + self.position[:, : h.shape[1]]
+        cond = self.time_embedding(self.log_sigma(t))
+        h = self.input_proj(x_t)
         for block in self.blocks:
             h = block(h, cond)
         return self.out(self.final_norm(h))
+
+    def score(self, x_t: torch.Tensor, t: torch.Tensor, schedule: object) -> torch.Tensor:
+        _, sigma = schedule.alpha_sigma(t)
+        return -self.forward(x_t, t) / sigma.view(-1, 1, 1).clamp_min(1e-5)
 
     def parameter_count(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters())

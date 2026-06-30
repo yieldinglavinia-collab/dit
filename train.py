@@ -34,14 +34,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-length", type=int, default=384)
     parser.add_argument("--limit-train-samples", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--normalize-clip", type=float, default=12.0)
+    parser.add_argument("--normalize-clip", type=float, default=None)
 
     parser.add_argument("--model-dim", type=int, default=160)
     parser.add_argument("--depth", type=int, default=5)
     parser.add_argument("--heads", type=int, default=5)
     parser.add_argument("--ff-mult", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.05)
-    parser.add_argument("--conv-kernel", type=int, default=5)
 
     parser.add_argument("--beta-min", type=float, default=0.1)
     parser.add_argument("--beta-max", type=float, default=20.0)
@@ -156,7 +155,9 @@ def main() -> None:
         heads=args.heads,
         ff_mult=args.ff_mult,
         dropout=args.dropout,
-        conv_kernel=args.conv_kernel,
+        beta_min=args.beta_min,
+        beta_max=args.beta_max,
+        t_eps=args.t_eps,
     )
     diffusion_cfg = DiffusionConfig(beta_min=args.beta_min, beta_max=args.beta_max, t_eps=args.t_eps)
     train_cfg = TrainConfig(
